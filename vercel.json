@@ -1,0 +1,16 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/events",
+      "schedule": "*/30 * * * *"
+    }
+  ],
+  "functions": {
+    "app/api/chat/**": {
+      "maxDuration": 30
+    },
+    "app/api/cron/**": {
+      "maxDuration": 300
+    }
+  }
+}

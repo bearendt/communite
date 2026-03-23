@@ -1,0 +1,454 @@
+// packages/db/prisma/schema.prisma
+// Communitē — Full data model
+// Neon serverless Postgres + Prisma ORM
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+}
+
+// ============================================================
+// USERS
+// ============================================================
+
+model User {
+  id            String    @id @default(cuid())
+  clerkId       String    @unique
+  email         String    @unique
+  phone         String?
+  phoneVerified Boolean   @default(false)
+
+  // Identity verification (Stripe Identity)
+  idVerified        Boolean   @default(false)
+  idVerificationRef String?   // Stripe Identity session ID
+  idVerifiedAt      DateTime?
+
+  // Profile
+  displayName   String
+  bio           String?
+  avatarUrl     String?
+  dietaryNotes  String?   // allergies, preferences
+  culturalBg    String?   // optional, for cultural exchange events
+
+  // Trust & standing
+  role          UserRole  @default(GUEST)
+  trustScore    Float     @default(0.0)
+  superHostAt   DateTime?
+
+  // Account status
+  isBanned      Boolean   @default(false)
+  bannedAt      DateTime?
+  bannedReason  String?
+  bannedBy      String?   // admin userId
+
+  // Subscription
+  tier          SubTier   @default(FREE)
+  tierExpiresAt DateTime?
+
+  // Push notifications (Expo)
+  expoPushToken String?   // updated on each app open; null = push disabled
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?             // soft delete
+
+  // Relations
+  hostedEvents      Event[]             @relation("EventHost")
+  rsvps             RSVP[]
+  dishAssignments   DishAssignment[]
+  reviewsGiven      Review[]            @relation("ReviewAuthor")
+  reviewsReceived   Review[]            @relation("ReviewSubject")
+  reportsFiled      Report[]            @relation("ReportFiler")
+  reportsAbout      Report[]            @relation("ReportSubject")
+  sentMessages      Message[]
+  tableMemberships  TableMembership[]
+  recipes           Recipe[]
+  auditLogs         AuditLog[]
+
+  @@index([clerkId])
+  @@index([email])
+  @@index([isBanned])
+}
+
+enum UserRole {
+  GUEST
+  HOST
+  SUPER_HOST
+  ADMIN
+}
+
+enum SubTier {
+  FREE
+  SUNDAY_TABLE   // $6.99/mo or $60/yr
+}
+
+// ============================================================
+// EVENTS
+// ============================================================
+
+model Event {
+  id          String      @id @default(cuid())
+  hostId      String
+  host        User        @relation("EventHost", fields: [hostId], references: [id])
+
+  // Details
+  title       String
+  description String
+  eventType   EventType
+  theme       String?
+  maxGuests   Int
+
+  // Location (full address stored; coordinates for proximity queries)
+  addressLine1  String
+  addressLine2  String?
+  city          String
+  state         String
+  zip           String
+  country       String    @default("US")
+  lat           Float
+  lng           Float
+  // Address is revealed only to confirmed RSVPs
+  addressHidden Boolean   @default(true)
+
+  // Timing
+  startsAt      DateTime
+  endsAt        DateTime
+
+  // Access control
+  isPrivate         Boolean   @default(false)
+  requiresIdVerif   Boolean   @default(false)
+  requiresPhone     Boolean   @default(true)
+  maxFreeTierRSVPs  Int       @default(2)
+
+  // Safety
+  status        EventStatus @default(DRAFT)
+  safetyCode    String?     // 6-char code generated at event start, not stored in plain text
+  suspendedAt   DateTime?
+  suspendedBy   String?     // admin userId
+  suspendReason String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  // Relations
+  rsvps           RSVP[]
+  dishAssignments DishAssignment[]
+  reports         Report[]
+  safetyLogs      SafetyLog[]
+  messages        Message[]
+
+  @@index([hostId])
+  @@index([status])
+  @@index([startsAt])
+  @@index([lat, lng])          // for proximity queries
+}
+
+enum EventType {
+  POTLUCK
+  WINE_TASTING
+  FARM_TO_TABLE
+  BLUE_ZONE
+  CULTURAL_EXCHANGE
+  ETHICAL_DINING
+  WELCOME_NEIGHBOR
+}
+
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  WAITLISTED
+  ACTIVE        // currently happening — safety monitoring on
+  COMPLETED
+  CANCELLED
+  SUSPENDED     // safety escalation — requires admin review
+}
+
+// ============================================================
+// RSVPs
+// ============================================================
+
+model RSVP {
+  id        String     @id @default(cuid())
+  eventId   String
+  event     Event      @relation(fields: [eventId], references: [id])
+  userId    String
+  user      User       @relation(fields: [userId], references: [id])
+  status    RSVPStatus @default(PENDING)
+  note      String?    // guest message to host
+  checkedIn Boolean    @default(false)
+  checkedInAt DateTime?
+
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([eventId, userId])
+  @@index([userId])
+  @@index([eventId, status])
+}
+
+enum RSVPStatus {
+  PENDING
+  CONFIRMED
+  DECLINED
+  WAITLISTED
+  NO_SHOW
+  REMOVED     // removed by host
+}
+
+// ============================================================
+// POTLUCK COORDINATOR — DISH ASSIGNMENTS
+// ============================================================
+
+model DishAssignment {
+  id        String    @id @default(cuid())
+  eventId   String
+  event     Event     @relation(fields: [eventId], references: [id])
+  userId    String?   // null = open slot
+  user      User?     @relation(fields: [userId], references: [id])
+
+  dishName  String
+  category  DishCategory
+  servings  Int?
+  notes     String?       // allergen info, prep notes
+  confirmed Boolean       @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([eventId])
+}
+
+enum DishCategory {
+  APPETIZER
+  MAIN
+  SIDE
+  DESSERT
+  DRINK
+  NON_ALCOHOLIC
+  BREAD
+  CONDIMENT
+  OTHER
+}
+
+// ============================================================
+// TRUST & SAFETY — REVIEWS
+// ============================================================
+
+model Review {
+  id          String  @id @default(cuid())
+  authorId    String
+  author      User    @relation("ReviewAuthor", fields: [authorId], references: [id])
+  subjectId   String
+  subject     User    @relation("ReviewSubject", fields: [subjectId], references: [id])
+  eventId     String?
+
+  rating      Int     // 1-5
+  body        String  @db.Text
+  // Reflection-based prompts (stored as structured JSON)
+  reflections Json?   // { "wouldAttendAgain": true, "feltWelcome": true, ... }
+  isPublic    Boolean @default(true)
+
+  // Moderation
+  isFlagged   Boolean   @default(false)
+  flaggedAt   DateTime?
+
+  createdAt   DateTime  @default(now())
+
+  @@unique([authorId, subjectId, eventId])
+  @@index([subjectId])
+}
+
+// ============================================================
+// TRUST & SAFETY — REPORTS + INCIDENT LOG
+// ============================================================
+
+model Report {
+  id          String       @id @default(cuid())
+  filerId     String
+  filer       User         @relation("ReportFiler", fields: [filerId], references: [id])
+  subjectId   String?
+  subject     User?        @relation("ReportSubject", fields: [subjectId], references: [id])
+  eventId     String?
+  event       Event?       @relation(fields: [eventId], references: [id])
+
+  type        ReportType
+  severity    Severity     @default(MEDIUM)
+  description String       @db.Text
+  evidence    String[]     // R2 asset URLs
+
+  status      ReportStatus @default(OPEN)
+  resolvedAt  DateTime?
+  resolvedBy  String?      // admin userId
+  resolution  String?
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([status, severity])
+  @@index([eventId])
+  @@index([subjectId])
+}
+
+enum ReportType {
+  INAPPROPRIATE_BEHAVIOR
+  SAFETY_CONCERN
+  HARASSMENT
+  FAKE_PROFILE
+  NO_SHOW
+  POLICY_VIOLATION
+  OTHER
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL   // triggers immediate event suspension
+}
+
+enum ReportStatus {
+  OPEN
+  ACKNOWLEDGED
+  INVESTIGATING
+  RESOLVED
+  DISMISSED
+}
+
+// Safety event log (append-only audit trail per event)
+model SafetyLog {
+  id        String   @id @default(cuid())
+  eventId   String
+  event     Event    @relation(fields: [eventId], references: [id])
+  actorId   String?  // userId or null for system events
+  type      SafetyLogType
+  payload   Json     // flexible metadata
+  createdAt DateTime @default(now())
+
+  @@index([eventId, createdAt])
+}
+
+enum SafetyLogType {
+  EVENT_STARTED
+  EVENT_ENDED
+  GUEST_CHECKED_IN
+  GUEST_REMOVED
+  REPORT_FILED
+  ESCALATED
+  ADMIN_NOTIFIED
+  STATUS_CHANGED
+  SAFETY_CODE_GENERATED
+}
+
+// ============================================================
+// MESSAGING
+// ============================================================
+
+model Message {
+  id          String      @id @default(cuid())
+  senderId    String
+  sender      User        @relation(fields: [senderId], references: [id])
+  channelId   String      // eventId, tableId, or DM thread ID
+  channelType ChannelType
+  body        String      @db.Text
+  isDeleted   Boolean     @default(false)
+  deletedAt   DateTime?
+
+  eventId     String?
+  event       Event?      @relation(fields: [eventId], references: [id])
+
+  createdAt   DateTime    @default(now())
+
+  @@index([channelId, channelType, createdAt])
+}
+
+enum ChannelType {
+  EVENT
+  DIRECT
+  PRIVATE_TABLE
+}
+
+// ============================================================
+// PRIVATE INTEREST TABLES (Sunday Table premium)
+// ============================================================
+
+model PrivateTable {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  topic       String
+  isPublic    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  memberships TableMembership[]
+}
+
+model TableMembership {
+  id        String       @id @default(cuid())
+  tableId   String
+  table     PrivateTable @relation(fields: [tableId], references: [id])
+  userId    String
+  user      User         @relation(fields: [userId], references: [id])
+  role      TableRole    @default(MEMBER)
+  joinedAt  DateTime     @default(now())
+
+  @@unique([tableId, userId])
+}
+
+enum TableRole {
+  MEMBER
+  MODERATOR
+  OWNER
+}
+
+// ============================================================
+// RECIPE VAULT (Sunday Table premium)
+// ============================================================
+
+model Recipe {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+
+  title        String
+  description  String?
+  ingredients  Json     // structured array
+  steps        Json     // structured array
+  servings     Int?
+  culturalNote String?  // the story behind the dish
+  originCountry String?
+  tags         String[]
+
+  isPublic     Boolean  @default(false)
+  coverImageUrl String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  deletedAt    DateTime?
+
+  @@index([userId])
+}
+
+// ============================================================
+// AUDIT LOG (security — append-only)
+// ============================================================
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String   // e.g. "user.ban", "event.suspend", "report.resolve"
+  entity    String?  // table name
+  entityId  String?
+  metadata  Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
